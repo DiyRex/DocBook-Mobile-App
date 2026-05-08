@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to release as (e.g. v0.1.1)'
+        description: 'Tag to release as (must already exist on the repo)'
         required: true
         default: 'v0.0.0-manual'
 
@@ -19,9 +19,8 @@ jobs:
     name: Build Android APK
     runs-on: ubuntu-latest
 
-    # Surface the keystore secret as an env var. We can then test it in
-    # step-level `if:` conditions (secrets.* cannot be referenced in
-    # `if:` directly).
+    # Read-only env mirror of the optional keystore secret. We can check
+    # this in step-level `if:` conditions; secrets.* is not allowed there.
     env:
       HAS_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE != '' }}
 
@@ -102,24 +101,37 @@ jobs:
           path: dist/*.apk
           retention-days: 30
 
+      - name: Generate release notes
+        run: |
+          T="${{ steps.tag.outputs.tag }}"
+          cat > release-notes.md <<EOF
+          ## DocBook Mobile $T
+
+          Native Android reader for the DocBook Markdown book repository format.
+
+          ### Install
+
+          Download **\`docbook-${T}-universal.apk\`** below and open it on your Android phone. Modern devices (2019+) can also use the smaller \`arm64-v8a\` variant.
+
+          ### About
+
+          See the [README](https://github.com/${{ github.repository }}/blob/main/README.md) for features and the first-run flow. Point it at any GitHub repo with an [\`index.json\`](https://github.com/DiyRex/DocBook/blob/main/AUTHORING.md) at the root.
+          EOF
+
+      # Idempotent release publish: if a release already exists for this
+      # tag (e.g. from a previously failed run), delete it first so this run
+      # creates a clean one. The tag itself is never deleted, so we don't
+      # retrigger the workflow.
       - name: Publish GitHub Release
-        if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: ${{ steps.tag.outputs.tag }}
-          generate_release_notes: true
-          files: dist/*.apk
-          fail_on_unmatched_files: true
-          body: |
-            ## DocBook Mobile ${{ steps.tag.outputs.tag }}
-
-            Native Android reader for the DocBook Markdown book repo format.
-
-            ### Install
-
-            Download **`docbook-${{ steps.tag.outputs.tag }}-universal.apk`** below and open it on your Android phone. Modern devices (2019+) can also use the smaller `arm64-v8a` variant.
-
-            ### About
-
-            See the [README](https://github.com/DiyRex/DocBook-Mobile-App/blob/main/README.md) for features and the first-run flow. Point it at any GitHub repo with an [`index.json`](https://github.com/DiyRex/DocBook/blob/main/AUTHORING.md) at the root.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          T="${{ steps.tag.outputs.tag }}"
+          if gh release view "$T" >/dev/null 2>&1; then
+            echo "Release $T already exists — deleting before recreating"
+            gh release delete "$T" -y
+          fi
+          gh release create "$T" \
+            --title "$T" \
+            --notes-file release-notes.md \
+            dist/*.apk
