@@ -804,8 +804,48 @@ class _NavButton extends StatelessWidget {
 class _CodeElementBuilder extends MarkdownElementBuilder {
   final bool isDark;
   final double scale;
+  // The highlight theme's `root` style ships with a background color that
+  // only paints over the text's bounding box — for short snippets this
+  // produces an ugly half-filled rectangle inside our container. We strip
+  // the background here so the container's color shows through uniformly.
+  late final Map<String, TextStyle> _theme = _stripRootBg(
+    isDark ? one_dark.atomOneDarkTheme : gh_light.githubTheme,
+  );
 
   _CodeElementBuilder({required this.isDark, required this.scale});
+
+  static Map<String, TextStyle> _stripRootBg(Map<String, TextStyle> src) {
+    final out = Map<String, TextStyle>.from(src);
+    final root = out['root'] ?? const TextStyle();
+    out['root'] = root.copyWith(backgroundColor: Colors.transparent);
+    return out;
+  }
+
+  // Defensive list of languages we ship a definition for. Anything not in
+  // this set (or empty/unspecified) is rendered as `plaintext` to avoid
+  // `Highlight().parse(...)` blowing up with "Must not be null" or with an
+  // unknown-language error on stranger fences.
+  static const _supported = {
+    'bash', 'sh', 'shell', 'zsh',
+    'c', 'cpp', 'cc', 'h', 'hpp',
+    'css', 'scss',
+    'dart',
+    'diff',
+    'go',
+    'html', 'xml',
+    'java', 'kotlin',
+    'javascript', 'js', 'typescript', 'ts',
+    'json', 'yaml', 'yml', 'toml', 'ini',
+    'makefile', 'cmake',
+    'markdown', 'md',
+    'objectivec', 'swift',
+    'php', 'ruby', 'rb',
+    'python', 'py',
+    'rust', 'rs',
+    'sql',
+    'plaintext', 'text', 'txt',
+    'asm', 'x86asm', 'armasm',
+  };
 
   @override
   Widget? visitElementAfter(md.Element element, TextStyle? preferredStyle) {
@@ -816,9 +856,13 @@ class _CodeElementBuilder extends MarkdownElementBuilder {
     final isBlock = cls.startsWith('language-') || text.contains('\n');
     if (!isBlock) return null;
 
-    final lang = cls.startsWith('language-')
-        ? cls.substring('language-'.length)
-        : null;
+    final declaredLang = cls.startsWith('language-')
+        ? cls.substring('language-'.length).trim().toLowerCase()
+        : '';
+    // Always pass a non-null language to HighlightView. Default to 'plaintext'
+    // for unspecified or unknown fences.
+    final lang = _supported.contains(declaredLang) ? declaredLang : 'plaintext';
+    final showBadge = declaredLang.isNotEmpty && lang != 'plaintext';
 
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 8),
@@ -837,10 +881,9 @@ class _CodeElementBuilder extends MarkdownElementBuilder {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          if (lang != null && lang.isNotEmpty)
+          if (showBadge)
             Container(
-              padding:
-                  const EdgeInsets.fromLTRB(14, 8, 14, 6),
+              padding: const EdgeInsets.fromLTRB(14, 8, 14, 6),
               decoration: BoxDecoration(
                 border: Border(
                   bottom: BorderSide(
@@ -851,7 +894,7 @@ class _CodeElementBuilder extends MarkdownElementBuilder {
                 ),
               ),
               child: Text(
-                lang.toUpperCase(),
+                declaredLang.toUpperCase(),
                 style: TextStyle(
                   fontSize: 10 * scale,
                   letterSpacing: 1.0,
@@ -862,26 +905,66 @@ class _CodeElementBuilder extends MarkdownElementBuilder {
                 ),
               ),
             ),
-          // Horizontal scroll for long code lines so we never wrap, which
-          // would mangle indentation. The HighlightView itself uses the
-          // VSCode-like theme (atom-one-dark / github).
+          // Horizontal scroll for long code lines so we never wrap (which
+          // would mangle indentation on phones).
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             padding: EdgeInsets.zero,
-            child: HighlightView(
-              text,
+            child: _SafeHighlight(
+              text: text,
               language: lang,
-              theme: isDark ? one_dark.atomOneDarkTheme : gh_light.githubTheme,
-              padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
-              textStyle: TextStyle(
-                fontFamily: 'monospace',
-                fontSize: 13.5 * scale,
-                height: 1.45,
-              ),
+              theme: _theme,
+              fontSize: 13.5 * scale,
             ),
           ),
         ],
       ),
     );
+  }
+}
+
+/// HighlightView wrapped in error guards. If the highlight engine throws for
+/// any reason (truly unknown language, malformed input), we still render the
+/// raw code as plain monospace rather than crashing the whole reader page.
+class _SafeHighlight extends StatelessWidget {
+  final String text;
+  final String language;
+  final Map<String, TextStyle> theme;
+  final double fontSize;
+
+  const _SafeHighlight({
+    required this.text,
+    required this.language,
+    required this.theme,
+    required this.fontSize,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final textStyle = TextStyle(
+      fontFamily: 'monospace',
+      fontSize: fontSize,
+      height: 1.45,
+    );
+    try {
+      return HighlightView(
+        text,
+        language: language,
+        theme: theme,
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+        textStyle: textStyle,
+      );
+    } catch (_) {
+      // Last-resort fallback: render raw text in the monospace style without
+      // syntax tokens so the reader stays usable.
+      final cs = Theme.of(context).colorScheme;
+      return Padding(
+        padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+        child: Text(
+          text,
+          style: textStyle.copyWith(color: cs.onSurface),
+        ),
+      );
+    }
   }
 }
