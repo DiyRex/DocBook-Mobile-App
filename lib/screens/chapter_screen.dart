@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter_highlight/flutter_highlight.dart';
+import 'package:flutter_highlight/themes/atom-one-dark.dart' as one_dark;
+import 'package:flutter_highlight/themes/github.dart' as gh_light;
 import 'package:flutter_markdown/flutter_markdown.dart';
+import 'package:markdown/markdown.dart' as md;
 import 'package:url_launcher/url_launcher.dart';
 
 import '../models/book_index.dart';
@@ -8,8 +12,9 @@ import '../services/index_service.dart';
 /// Reader screen.
 ///
 /// Each chapter is one horizontal page in a [PageView]. Within a chapter the
-/// content scrolls vertically. We pre-fetch the previous/next chapter so the
-/// swipe is instant.
+/// content scrolls vertically inside a *lazy* [Markdown] (which renders one
+/// block per ListView entry) so we don't pay to materialize the entire
+/// chapter on swipe.
 class ChapterScreen extends StatefulWidget {
   final Book book;
   final IndexService service;
@@ -76,7 +81,7 @@ class _ChapterScreenState extends State<ChapterScreen> {
     if (i < 0 || i >= _flat.length) return;
     await _pageController.animateToPage(
       i,
-      duration: const Duration(milliseconds: 350),
+      duration: const Duration(milliseconds: 320),
       curve: Curves.easeOutCubic,
     );
   }
@@ -163,9 +168,11 @@ class _ChapterScreenState extends State<ChapterScreen> {
               controller: _pageController,
               itemCount: _flat.length,
               onPageChanged: _onPage,
+              physics: const PageScrollPhysics(),
               itemBuilder: (ctx, i) {
                 _ensureLoaded(i);
                 return _ChapterPage(
+                  key: ValueKey('chapter-$i'),
                   ref: _flat[i],
                   bodyFuture: _bodies[i]!,
                   scale: _scale,
@@ -272,6 +279,7 @@ class _ChapterPage extends StatelessWidget {
   final VoidCallback onRetry;
 
   const _ChapterPage({
+    super.key,
     required this.ref,
     required this.bodyFuture,
     required this.scale,
@@ -295,8 +303,7 @@ class _ChapterPage extends StatelessWidget {
               mainAxisAlignment: MainAxisAlignment.center,
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
-                Icon(Icons.cloud_off_outlined,
-                    size: 56, color: cs.error),
+                Icon(Icons.cloud_off_outlined, size: 56, color: cs.error),
                 const SizedBox(height: 16),
                 Text(
                   'Could not load this chapter',
@@ -319,7 +326,7 @@ class _ChapterPage extends StatelessWidget {
             ),
           );
         }
-        return _RenderedMarkdown(
+        return _RenderedChapter(
           ref: ref,
           body: snap.data ?? '',
           scale: scale,
@@ -330,30 +337,57 @@ class _ChapterPage extends StatelessWidget {
   }
 }
 
-class _RenderedMarkdown extends StatelessWidget {
+/// Stateful so we can memoize the cleaned markdown body and the style sheet —
+/// both are invariant per (body, scale, accent, brightness) and recomputing
+/// them on every parent rebuild was hundreds of allocations of overhead.
+class _RenderedChapter extends StatefulWidget {
   final ChapterRef ref;
   final String body;
   final double scale;
   final Color accent;
 
-  const _RenderedMarkdown({
+  const _RenderedChapter({
     required this.ref,
     required this.body,
     required this.scale,
     required this.accent,
   });
 
+  @override
+  State<_RenderedChapter> createState() => _RenderedChapterState();
+}
+
+class _RenderedChapterState extends State<_RenderedChapter> {
+  late String _cleanedBody;
+  MarkdownStyleSheet? _styleSheet;
+  Brightness? _styleSheetBrightness;
+  double? _styleSheetScale;
+  // Memoized code-block builder (rebuilt only when scale or brightness changes)
+  Map<String, MarkdownElementBuilder>? _builders;
+
+  @override
+  void initState() {
+    super.initState();
+    _cleanedBody = _clean(widget.body);
+  }
+
+  @override
+  void didUpdateWidget(covariant _RenderedChapter oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (widget.body != oldWidget.body) {
+      _cleanedBody = _clean(widget.body);
+    }
+  }
+
   /// Strip the chapter's redundant heading + bottom-of-page nav block. The
   /// app provides better navigation chrome, so the textual links only add
   /// noise inside the reader.
-  String _clean(String src) {
+  static String _clean(String src) {
     var out = src;
-    // Remove leading "# Chapter N — Title" so we don't double up the title.
     out = out.replaceFirst(
       RegExp(r'^\s*#\s+Chapter\s+\d+.*?\n+', multiLine: true),
       '',
     );
-    // Strip horizontal-rule + nav-block we add to chapters
     final navRe = RegExp(
       r'\n*\s*-{3,}\s*\n+\s*\*\*\[(?:← Previous|Up|Next).*?$',
       multiLine: true,
@@ -363,39 +397,36 @@ class _RenderedMarkdown extends StatelessWidget {
     return out.trimRight();
   }
 
-  void _onTapLink(BuildContext context, String text, String? href, String title) {
+  void _onTapLink(String text, String? href, String title) {
     if (href == null || href.isEmpty) return;
     if (href.startsWith('http://') || href.startsWith('https://')) {
       final uri = Uri.tryParse(href);
       if (uri != null) launchUrl(uri, mode: LaunchMode.externalApplication);
     }
-    // Internal navigation is handled by the page navigation; in-text links to
-    // sibling chapters are intentionally a no-op here so the reader stays
-    // linear. Users use the bottom nav / chapter sheet to jump.
+    // Internal/relative links inside the body intentionally no-op:
+    // the reader navigates linearly via the bottom prev/next + jump sheet.
   }
 
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final cleanBody = _clean(body);
-    final isDark = Theme.of(context).brightness == Brightness.dark;
+  MarkdownStyleSheet _buildStyleSheet(BuildContext context) {
+    final theme = Theme.of(context);
+    final cs = theme.colorScheme;
+    final isDark = theme.brightness == Brightness.dark;
+    final scale = widget.scale;
+    final accent = widget.accent;
 
-    final base = Theme.of(context).textTheme;
-    final scaled = base.copyWith(
-      bodyLarge: base.bodyLarge?.copyWith(
-        fontSize: (base.bodyLarge?.fontSize ?? 16) * scale,
-        height: 1.6,
-        letterSpacing: 0.1,
+    final base = theme.textTheme;
+    return MarkdownStyleSheet.fromTheme(theme.copyWith(
+      textTheme: base.copyWith(
+        bodyLarge: base.bodyLarge?.copyWith(
+          fontSize: (base.bodyLarge?.fontSize ?? 16) * scale,
+          height: 1.6,
+          letterSpacing: 0.1,
+        ),
+        bodyMedium: base.bodyMedium?.copyWith(
+          fontSize: (base.bodyMedium?.fontSize ?? 14) * scale,
+          height: 1.55,
+        ),
       ),
-      bodyMedium: base.bodyMedium?.copyWith(
-        fontSize: (base.bodyMedium?.fontSize ?? 14) * scale,
-        height: 1.55,
-      ),
-    );
-
-    final styleSheet =
-        MarkdownStyleSheet.fromTheme(Theme.of(context).copyWith(
-      textTheme: scaled,
     )).copyWith(
       h1: TextStyle(
         fontSize: 24 * scale,
@@ -442,25 +473,24 @@ class _RenderedMarkdown extends StatelessWidget {
         fontStyle: FontStyle.italic,
         height: 1.5,
       ),
-      // Code styling — high contrast in both themes.
-      // flutter_markdown reuses this `code` TextStyle for inline AND for
-      // text inside a code block, so we deliberately do not set a
-      // backgroundColor here (it would bleed inside the block container).
-      // Inline `code` is distinguished by color + monospace + weight.
+      // High-contrast code styling. We intentionally do NOT set a
+      // backgroundColor on `code:` because flutter_markdown reuses this
+      // TextStyle for both inline `code` and the text inside a fenced block,
+      // which would bleed inside the codeblockDecoration container.
       code: TextStyle(
         fontFamily: 'monospace',
         fontSize: 14.5 * scale,
         height: 1.45,
         fontWeight: FontWeight.w600,
         color: isDark
-            ? const Color(0xFFE6EDF3) // near-white for code blocks on dark
-            : const Color(0xFF24292F), // near-black for light
+            ? const Color(0xFFE6EDF3) // GitHub dark code text
+            : const Color(0xFF24292F), // GitHub light code text
       ),
       codeblockPadding: const EdgeInsets.all(16),
       codeblockDecoration: BoxDecoration(
         color: isDark
-            ? const Color(0xFF0D1117) // GitHub dark code bg
-            : const Color(0xFFF6F8FA), // GitHub light code bg
+            ? const Color(0xFF0D1117)
+            : const Color(0xFFF6F8FA),
         borderRadius: BorderRadius.circular(10),
         border: Border.all(
           color: isDark
@@ -492,127 +522,122 @@ class _RenderedMarkdown extends StatelessWidget {
         decorationColor: accent.withValues(alpha: 0.5),
       ),
       horizontalRuleDecoration: BoxDecoration(
-        border: Border(
-            top: BorderSide(color: cs.outlineVariant, width: 1)),
+        border: Border(top: BorderSide(color: cs.outlineVariant, width: 1)),
       ),
     );
+  }
 
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(20, 16, 20, 60),
-      children: [
-        _ChapterHeader(ref: ref, accent: accent, scale: scale),
-        const SizedBox(height: 20),
-        MarkdownBody(
-          data: cleanBody,
-          selectable: true,
-          shrinkWrap: true,
-          softLineBreak: true,
-          styleSheet: styleSheet,
-          onTapLink: (t, h, title) => _onTapLink(context, t, h, title),
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    // Memoize: only rebuild stylesheet when scale or brightness changes.
+    if (_styleSheet == null ||
+        _styleSheetBrightness != theme.brightness ||
+        _styleSheetScale != widget.scale) {
+      _styleSheet = _buildStyleSheet(context);
+      _styleSheetBrightness = theme.brightness;
+      _styleSheetScale = widget.scale;
+      _builders = {
+        'code': _CodeElementBuilder(
+          isDark: theme.brightness == Brightness.dark,
+          scale: widget.scale,
         ),
-        const SizedBox(height: 32),
+      };
+    }
+
+    return Column(
+      children: [
+        _CompactChapterHeader(ref: widget.ref, accent: widget.accent),
+        Expanded(
+          // The scrollable Markdown widget builds blocks lazily, so we never
+          // materialize the entire ~8 KB chapter at once.
+          child: Markdown(
+            data: _cleanedBody,
+            // Disable text selection — adds a SelectionRegistrar per block,
+            // which is a real cost on long chapters and was producing the
+            // "Skipped 286 frames!" reports during PageView swipes.
+            selectable: false,
+            softLineBreak: true,
+            padding: const EdgeInsets.fromLTRB(20, 12, 20, 60),
+            styleSheet: _styleSheet,
+            onTapLink: _onTapLink,
+            builders: _builders ?? const {},
+          ),
+        ),
       ],
     );
   }
 }
 
-class _ChapterHeader extends StatelessWidget {
+/// Compact, sticky-style header shown above the scrolling content. Replaces
+/// the older big in-content hero — that lived inside the same scroll list
+/// which forced eager layout of the whole chapter when it was a ListView.
+class _CompactChapterHeader extends StatelessWidget {
   final ChapterRef ref;
   final Color accent;
-  final double scale;
-  const _ChapterHeader({
-    required this.ref,
-    required this.accent,
-    required this.scale,
-  });
+  const _CompactChapterHeader({required this.ref, required this.accent});
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          'Chapter ${ref.chapter.n}',
-          style: TextStyle(
-            color: accent,
-            fontWeight: FontWeight.w800,
-            fontSize: 12 * scale,
-            letterSpacing: 1.5,
-          ),
+    return Container(
+      padding: const EdgeInsets.fromLTRB(20, 12, 20, 12),
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: cs.outlineVariant.withValues(alpha: 0.4)),
         ),
-        const SizedBox(height: 8),
-        Text(
-          ref.chapter.title,
-          style: TextStyle(
-            fontWeight: FontWeight.w800,
-            fontSize: 30 * scale,
-            height: 1.15,
-            color: cs.onSurface,
-            letterSpacing: -0.4,
-          ),
-        ),
-        if (ref.chapter.subtitle.isNotEmpty) ...[
-          const SizedBox(height: 10),
-          Text(
-            ref.chapter.subtitle,
-            style: TextStyle(
-              fontSize: 16 * scale,
-              color: cs.onSurfaceVariant,
-              fontWeight: FontWeight.w500,
-              height: 1.4,
-            ),
-          ),
-        ],
-        const SizedBox(height: 14),
-        Row(
-          children: [
-            Icon(Icons.schedule_outlined,
-                size: 14, color: cs.onSurfaceVariant),
-            const SizedBox(width: 4),
-            Text(
-              '${ref.chapter.minutes} min read',
-              style: TextStyle(
-                color: cs.onSurfaceVariant,
-                fontSize: 12 * scale,
-                fontWeight: FontWeight.w600,
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: accent.withValues(alpha: 0.14),
+                  borderRadius: BorderRadius.circular(6),
+                ),
+                child: Text(
+                  'CH ${ref.chapter.n}',
+                  style: TextStyle(
+                    color: accent,
+                    fontWeight: FontWeight.w800,
+                    fontSize: 11,
+                    letterSpacing: 0.8,
+                  ),
+                ),
               ),
-            ),
-            const SizedBox(width: 12),
-            Container(
-              width: 4,
-              height: 4,
-              decoration: BoxDecoration(
-                color: cs.outlineVariant,
-                borderRadius: BorderRadius.circular(2),
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
-                ref.part.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
+              const SizedBox(width: 8),
+              Icon(Icons.schedule_outlined,
+                  size: 12, color: cs.onSurfaceVariant),
+              const SizedBox(width: 4),
+              Text(
+                '${ref.chapter.minutes} min',
                 style: TextStyle(
                   color: cs.onSurfaceVariant,
-                  fontSize: 12 * scale,
+                  fontSize: 11,
                   fontWeight: FontWeight.w600,
                 ),
               ),
-            ),
-          ],
-        ),
-        const SizedBox(height: 12),
-        Container(
-          height: 4,
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              colors: [accent, accent.withValues(alpha: 0.0)],
-            ),
-            borderRadius: BorderRadius.circular(2),
+            ],
           ),
-        ),
-      ],
+          const SizedBox(height: 6),
+          Text(
+            ref.chapter.title,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              color: cs.onSurface,
+              fontWeight: FontWeight.w800,
+              fontSize: 18,
+              height: 1.2,
+              letterSpacing: -0.2,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -767,6 +792,95 @@ class _NavButton extends StatelessWidget {
                           color: color, fontWeight: FontWeight.w700)),
                 ],
         ),
+      ),
+    );
+  }
+}
+
+/// Renders fenced code blocks with VSCode-style syntax highlighting via
+/// `flutter_highlight`. Inline `` `code` `` falls through to the default
+/// rendering (returning null from [visitElementAfter]) so it picks up the
+/// stylesheet's `code:` TextStyle.
+class _CodeElementBuilder extends MarkdownElementBuilder {
+  final bool isDark;
+  final double scale;
+
+  _CodeElementBuilder({required this.isDark, required this.scale});
+
+  @override
+  Widget? visitElementAfter(md.Element element, TextStyle? preferredStyle) {
+    final text = element.textContent;
+    final cls = element.attributes['class'] ?? '';
+    // Fenced blocks always carry "language-XYZ" or contain a newline. Inline
+    // `code` is a single line with no class — render with the default style.
+    final isBlock = cls.startsWith('language-') || text.contains('\n');
+    if (!isBlock) return null;
+
+    final lang = cls.startsWith('language-')
+        ? cls.substring('language-'.length)
+        : null;
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      decoration: BoxDecoration(
+        color: isDark
+            ? const Color(0xFF0D1117) // GitHub dark
+            : const Color(0xFFF6F8FA), // GitHub light
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: isDark
+              ? const Color(0xFF30363D)
+              : const Color(0xFFD0D7DE),
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (lang != null && lang.isNotEmpty)
+            Container(
+              padding:
+                  const EdgeInsets.fromLTRB(14, 8, 14, 6),
+              decoration: BoxDecoration(
+                border: Border(
+                  bottom: BorderSide(
+                    color: isDark
+                        ? const Color(0xFF21262D)
+                        : const Color(0xFFE5E7EB),
+                  ),
+                ),
+              ),
+              child: Text(
+                lang.toUpperCase(),
+                style: TextStyle(
+                  fontSize: 10 * scale,
+                  letterSpacing: 1.0,
+                  fontWeight: FontWeight.w700,
+                  color: isDark
+                      ? const Color(0xFF7D8590)
+                      : const Color(0xFF6E7781),
+                ),
+              ),
+            ),
+          // Horizontal scroll for long code lines so we never wrap, which
+          // would mangle indentation. The HighlightView itself uses the
+          // VSCode-like theme (atom-one-dark / github).
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            padding: EdgeInsets.zero,
+            child: HighlightView(
+              text,
+              language: lang,
+              theme: isDark ? one_dark.atomOneDarkTheme : gh_light.githubTheme,
+              padding: const EdgeInsets.fromLTRB(14, 12, 14, 14),
+              textStyle: TextStyle(
+                fontFamily: 'monospace',
+                fontSize: 13.5 * scale,
+                height: 1.45,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
